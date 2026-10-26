@@ -4,6 +4,7 @@
 
 ### Bug Fixes
 - **Inbound Call Quality Metrics**: Set `Call.debug` and `Call.enableQualityMetrics` *before* `Call.configureStatsReporter()` in `Call.answer(customHeaders:debug:completion:)`, so inbound calls answered with `debug: true` create their stats reporter and `onCallQualityChange` fires as expected. The previous ordering left `statsReporter` nil for inbound calls (outbound and attach paths were unaffected) — GH #378.
+- **Stale CallKit Answer on the Next Push Call**: An answer from CallKit with no VoIP push in flight and no call is now failed and cleared by the INVITE timeout, instead of being kept and used to auto-answer the next push INVITE without a CallKit answer, which left the caller on a silent line. An answer made before `processVoIPNotification` is still used for its push.
 
 ## [4.2.2](https://github.com/team-telnyx/telnyx-webrtc-ios/releases/tag/4.2.2) (2026-10-05)
 

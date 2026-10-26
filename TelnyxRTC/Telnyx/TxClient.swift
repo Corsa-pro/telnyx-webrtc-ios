@@ -951,6 +951,10 @@ public class TxClient {
             /// Set call quality metrics
             self.enableQualityMetrics = debug
             releaseActiveCall(answerAction.callUUID)
+            // The push for this answer may still be on its way. If no INVITE follows, the
+            // timeout fails and clears the action so the next push INVITE is not auto-answered with it.
+            self.currentCallId = answerAction.callUUID
+            startInviteTimeout()
         }
     }
 
@@ -985,6 +989,10 @@ public class TxClient {
 
     internal func releaseActiveCallForTesting(_ callId: UUID) {
         releaseActiveCall(callId)
+    }
+
+    internal var hasPendingAnswerActionForTesting: Bool {
+        answerCallAction != nil
     }
 #endif
     
@@ -1676,6 +1684,10 @@ extension TxClient {
         }
 
         self.pushMetaData = pushMetaData
+        // An answer tapped before this push arrived is now handled by the push flow and its own timeout.
+        if !isCallFromPush {
+            stopInviteTimeout()
+        }
         // A VoIP push is authoritative for this incoming call. Update the
         // cached ID before any reconnect path can call the normal connect API.
         self.voiceSdkId = rtc_id
