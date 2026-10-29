@@ -24,6 +24,10 @@ internal final class SignalingHealthMonitor {
         /// signaling socket with the same session; media may heal by itself
         /// in the meantime, which `recordInboundRtpPackets` notices.
         case awaitingSignaling
+        /// A path changed but the socket is still viable, so nothing was
+        /// replaced: libwebrtc is expected to move the media by itself.
+        /// Inbound RTP resuming ends it; silence escalates to an ICE restart.
+        case watchingMedia
     }
 
     private enum SignalingProbePurpose {
@@ -40,6 +44,7 @@ internal final class SignalingHealthMonitor {
     private let postIceRestartMediaTimeout: TimeInterval
     private let peerDisconnectedRecoveryDelay: TimeInterval
     private let pathRecoveryTimeout: TimeInterval
+    private let mediaWatchTimeout: TimeInterval
     private let isSignalingAvailable: () -> Bool
     private let sendSignalingProbe: () -> String?
     private let startIceRestart: (Call) -> Void
@@ -55,6 +60,7 @@ internal final class SignalingHealthMonitor {
     private var mediaVerificationTimeoutWorkItem: DispatchWorkItem?
     private var peerDisconnectedRecoveryWorkItem: DispatchWorkItem?
     private var pathRecoveryTimeoutWorkItem: DispatchWorkItem?
+    private var mediaWatchTimeoutWorkItem: DispatchWorkItem?
     private var pendingSignalingProbeId: String?
     private var pendingSignalingProbePurpose: SignalingProbePurpose?
     private var lastInboundSignalingActivity = Date()
@@ -83,6 +89,7 @@ internal final class SignalingHealthMonitor {
         postIceRestartMediaTimeout: TimeInterval = 3,
         peerDisconnectedRecoveryDelay: TimeInterval = 2,
         pathRecoveryTimeout: TimeInterval = 8,
+        mediaWatchTimeout: TimeInterval = 3,
         isSignalingAvailable: @escaping () -> Bool,
         sendSignalingProbe: @escaping () -> String?,
         startIceRestart: @escaping (Call) -> Void,
@@ -99,6 +106,7 @@ internal final class SignalingHealthMonitor {
         self.postIceRestartMediaTimeout = postIceRestartMediaTimeout
         self.peerDisconnectedRecoveryDelay = peerDisconnectedRecoveryDelay
         self.pathRecoveryTimeout = pathRecoveryTimeout
+        self.mediaWatchTimeout = mediaWatchTimeout
         self.isSignalingAvailable = isSignalingAvailable
         self.sendSignalingProbe = sendSignalingProbe
         self.startIceRestart = startIceRestart
@@ -112,6 +120,7 @@ internal final class SignalingHealthMonitor {
         signalingHealthCheckTimer?.cancel()
         peerDisconnectedRecoveryWorkItem?.cancel()
         pathRecoveryTimeoutWorkItem?.cancel()
+        mediaWatchTimeoutWorkItem?.cancel()
     }
 
     /// The network went away under a live call. The peer is left alone: it
@@ -156,6 +165,51 @@ internal final class SignalingHealthMonitor {
             self.lastInboundRtpProgressAt = nil
             call.setCallReportMediaVerificationSamplingEnabled(true)
             self.startPathRecoveryTimeout(for: call)
+        }
+    }
+
+    /// A path changed under a live call while the signaling socket is still
+    /// viable (cellular -> Wi-Fi: the cellular socket lives on). Nothing is
+    /// replaced. A re-login is what makes the server attach, and an attach
+    /// is a rebuilt peer, so the cheapest handover is to not log in again:
+    /// libwebrtc gathers on the new interface and moves to it on its own,
+    /// the lower-cost network winning, and the server latches onto the
+    /// nominated pair. Measured 2026-10-29: every socket swap ended in an
+    /// attach, 3.8-4.6 s to audio; this path is meant to be under a second.
+    func networkPathDidChangeKeepingSignaling(for call: Call) {
+        executeOnQueue { [weak self] in
+            guard let self = self, self.recoveryMode == .idle || self.recoveryMode == .watchingMedia else {
+                Logger.log.i(message: "[CALL-RECOVERY] Network path changed during a recovery; the recovery stands")
+                return
+            }
+            Logger.log.i(message: "[CALL-RECOVERY] Network path changed with the socket viable; keeping peer and socket, watching media")
+            self.cancelPeerDisconnectedRecovery()
+            self.recoveringCall = call
+            self.shouldEvaluateRelayFallback = false
+            self.recoveryMode = .watchingMedia
+            self.pathChangedAt = Date()
+            self.mediaHealedAt = nil
+            self.lastInboundRtpPacketCount = nil
+            self.lastInboundRtpProgressAt = nil
+            call.setCallReportMediaVerificationSamplingEnabled(true)
+            self.startMediaWatchTimeout(for: call)
+        }
+    }
+
+    /// The server attached the call on its own after a re-login, replacing
+    /// the kept peer: that is the reattach done for us, and the attached
+    /// call's ACTIVE ends the recovery. Without this the recovery hung on a
+    /// call that no longer existed, and the monitor was blind to anything
+    /// that happened to the new one.
+    func serverDidAttach() {
+        executeOnQueue { [weak self] in
+            guard let self = self, self.recoveryMode != .idle else { return }
+            Logger.log.i(message: "[CALL-RECOVERY] Server attached the call during recovery; waiting for it to be active")
+            self.cancelRecoveryTimeouts()
+            self.cancelPeerDisconnectedRecovery()
+            self.recoveringCall = nil
+            self.shouldEvaluateRelayFallback = false
+            self.recoveryMode = .reattaching
         }
     }
 
@@ -261,10 +315,11 @@ internal final class SignalingHealthMonitor {
                 if self.recoveryMode == .reattaching {
                     Logger.log.i(message: "[CALL-RECOVERY] Reattached call is active")
                     self.finishRecovery()
-                } else if self.recoveryMode != .idle, let recovering = self.recoveringCall, recovering !== call {
-                    // The server attached a replacement on its own while the
-                    // old peer was being kept; the replacement is the call now.
-                    Logger.log.i(message: "[CALL-RECOVERY] Server-attached call is active")
+                } else if self.recoveryMode != .idle, self.recoveringCall !== call {
+                    // A replacement call, or the recovering one is gone: the
+                    // recovery has nothing left to do. `recoveringCall` is
+                    // weak, so a replaced call reads as nil here.
+                    Logger.log.i(message: "[CALL-RECOVERY] A different call is active; ending the recovery")
                     self.finishRecovery()
                 }
                 self.monitoredActiveCall = call
@@ -296,9 +351,15 @@ internal final class SignalingHealthMonitor {
             Logger.log.i(message: "[CALL-RECOVERY] Ignoring \(trigger); call is \(call.callState.value)")
             return
         }
-        guard recoveryMode == .idle else {
+        guard recoveryMode == .idle || recoveryMode == .watchingMedia else {
             Logger.log.i(message: "[CALL-RECOVERY] Ignoring \(trigger); recovery is already in progress")
             return
+        }
+        if recoveryMode == .watchingMedia {
+            // The peer did not survive the path change on its own.
+            Logger.log.w(message: "[CALL-RECOVERY] \(trigger) while watching media after a path change")
+            cancelMediaWatchTimeout()
+            recoveryMode = .idle
         }
 
         recoveringCall = call
@@ -425,6 +486,10 @@ internal final class SignalingHealthMonitor {
                 Logger.log.i(message: "[CALL-RECOVERY] Inbound RTP resumed after ICE restart")
                 finishRecovery(recoveredInPlace: call)
             }
+        case .watchingMedia:
+            let elapsed = pathChangedAt.map { now.timeIntervalSince($0) } ?? 0
+            Logger.log.i(message: "[CALL-RECOVERY] Inbound RTP flowing \(String(format: "%.1f", elapsed))s after the path change; nothing was replaced")
+            finishRecovery()
         case .awaitingSignaling:
             // Media healed before signaling is back. Remembered, not acted
             // on: the socket still has to be replaced, and
@@ -501,10 +566,12 @@ internal final class SignalingHealthMonitor {
     private func startPathRecoveryTimeout(for call: Call) {
         cancelPathRecoveryTimeout()
         let workItem = DispatchWorkItem { [weak self, weak call] in
-            guard let self = self,
-                  let call = call,
-                  self.recoveryMode == .awaitingSignaling,
-                  self.recoveringCall === call else { return }
+            guard let self = self, self.recoveryMode == .awaitingSignaling else { return }
+            guard let call = call, self.recoveringCall === call else {
+                // The call this was about is gone; nothing to reattach.
+                self.finishRecovery()
+                return
+            }
             Logger.log.e(message: "[CALL-RECOVERY] Signaling did not return within \(self.pathRecoveryTimeout)s of the path change; reattaching")
             self.beginReattach()
         }
@@ -515,6 +582,28 @@ internal final class SignalingHealthMonitor {
     private func cancelPathRecoveryTimeout() {
         pathRecoveryTimeoutWorkItem?.cancel()
         pathRecoveryTimeoutWorkItem = nil
+    }
+
+    private func startMediaWatchTimeout(for call: Call) {
+        cancelMediaWatchTimeout()
+        let workItem = DispatchWorkItem { [weak self, weak call] in
+            guard let self = self, self.recoveryMode == .watchingMedia else { return }
+            guard let call = call, self.recoveringCall === call else {
+                self.finishRecovery()
+                return
+            }
+            Logger.log.w(message: "[CALL-RECOVERY] No inbound RTP \(self.mediaWatchTimeout)s after the path change; restarting ICE")
+            self.cancelMediaWatchTimeout()
+            self.shouldEvaluateRelayFallback = true
+            self.startIceRestartRecovery(for: call)
+        }
+        mediaWatchTimeoutWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + mediaWatchTimeout, execute: workItem)
+    }
+
+    private func cancelMediaWatchTimeout() {
+        mediaWatchTimeoutWorkItem?.cancel()
+        mediaWatchTimeoutWorkItem = nil
     }
 
     private func beginReattach() {
@@ -561,6 +650,7 @@ internal final class SignalingHealthMonitor {
         cancelSignalingProbeTimeout()
         cancelMediaVerificationTimeout()
         cancelPathRecoveryTimeout()
+        cancelMediaWatchTimeout()
     }
 
     private func cancelIceRestartTimeout() {

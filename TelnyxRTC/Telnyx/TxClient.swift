@@ -212,6 +212,10 @@ public class TxClient {
     /// A socket replacement after a path change is under way.
     private var pathRecoveryInFlight = false
     private var viabilityWorkItem: DispatchWorkItem?
+    /// The transport's last word on whether the current socket can carry
+    /// data. A Wi-Fi socket reports false within milliseconds of the phone
+    /// moving to cellular; a cellular socket stays viable when Wi-Fi comes.
+    private var socketViable = true
     
     /// AI Assistant Manager for handling AI-related functionality
     public let aiAssistantManager = AIAssistantManager()
@@ -635,6 +639,7 @@ public class TxClient {
 
         self.serverConfiguration = serverConfigurationForConnection(serverConfiguration)
         retireCurrentSocket()
+        socketViable = true
         self.socket = Socket()
         self.socket?.delegate = self
         self.aiAssistantManager.setSocket(self.socket)
@@ -659,6 +664,7 @@ public class TxClient {
 
         Logger.log.i(message: "TxClient:: serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
         retireCurrentSocket()
+        socketViable = true
         self.socket = Socket()
         self.socket?.delegate = self
         self.aiAssistantManager.setSocket(self.socket)
@@ -700,6 +706,7 @@ public class TxClient {
 
         Logger.log.i(message: "TxClient:: serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
         retireCurrentSocket()
+        socketViable = true
         self.socket = Socket()
         self.socket?.delegate = self
         self.socket?.connect(signalingServer: self.serverConfiguration.signalingServer)
@@ -1221,6 +1228,7 @@ public class TxClient {
             
             // Initialize socket and start connection
             retireCurrentSocket()
+        socketViable = true
         self.socket = Socket()
             self.socket?.delegate = self
             self.aiAssistantManager.setSocket(self.socket)
@@ -2143,6 +2151,7 @@ extension TxClient : SocketDelegate {
     func onSocketViabilityChanged(viable: Bool) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            self.socketViable = viable
             self.viabilityWorkItem?.cancel()
             self.viabilityWorkItem = nil
             guard !viable, self.hasLiveCalls, !self.pathRecoveryInFlight else { return }
@@ -2151,7 +2160,7 @@ extension TxClient : SocketDelegate {
             // not: a Wi-Fi that is still "up" but carries nothing.
             let item = DispatchWorkItem { [weak self] in
                 guard let self = self, self.hasLiveCalls, !self.pathRecoveryInFlight else { return }
-                self.beginPathChangeRecovery(trigger: "socket not viable for 2s")
+                self.beginPathChangeRecovery(trigger: "socket not viable for 2s", keepSignalingIfViable: false)
             }
             self.viabilityWorkItem = item
             DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: item)
@@ -2199,14 +2208,17 @@ extension TxClient : SocketDelegate {
         return calls.values.first(where: isLive)
     }
 
-    /// Keeps the peer and replaces the signaling socket with the same
-    /// session. The monitor takes it from there: media that heals by itself
-    /// ends the recovery once the new socket is registered, otherwise ICE
-    /// restarts over it, and the reattach (`reconnectClient`) stays the last
-    /// resort. The login on the new socket does not ask the server to
-    /// attach; if the server attaches regardless, the kept peer is released
-    /// in favour of the attached one.
-    private func beginPathChangeRecovery(trigger: String) {
+    /// Keeps the peer through a path change.
+    ///
+    /// If the socket is still viable nothing is replaced: the monitor watches
+    /// for media on the new path and escalates to an ICE restart if none
+    /// comes. Otherwise the socket is replaced with the same session; the
+    /// server has been seen to attach the call on every re-login, whatever
+    /// the login says, so this is a fast reattach rather than none — about
+    /// 4 s to audio measured, against 10-28 s for the former flow — and the
+    /// kept peer is released for the attached one. `reconnectClient` stays
+    /// the last resort.
+    private func beginPathChangeRecovery(trigger: String, keepSignalingIfViable: Bool = true) {
         guard txConfig?.reconnectClient == true else {
             Logger.log.i(message: "TxClient:: Reconnect Disabled")
             return
@@ -2214,6 +2226,11 @@ extension TxClient : SocketDelegate {
         guard let call = liveCall else { return }
         guard !pathRecoveryInFlight else {
             Logger.log.i(message: "[CALL-RECOVERY] \(trigger); the socket is already being replaced")
+            return
+        }
+        if keepSignalingIfViable, socketViable, socket?.isConnected == true, gatewayState == .REGED {
+            Logger.log.i(message: "[CALL-RECOVERY] \(trigger): socket still viable, keeping peer and socket")
+            signalingHealthMonitor.networkPathDidChangeKeepingSignaling(for: call)
             return
         }
         Logger.log.w(message: "[CALL-RECOVERY] \(trigger): keeping the peer, replacing the socket")
@@ -2514,6 +2531,7 @@ extension TxClient : SocketDelegate {
                         kept.endForAttachCall()
                     }
                     self.pathRecoveryInFlight = false
+                    self.signalingHealthMonitor.serverDidAttach()
                     self.createIncomingCall(callerName: callerName,
                                             callerNumber: callerNumber,
                                             callId: uuid,
