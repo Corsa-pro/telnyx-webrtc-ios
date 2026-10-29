@@ -783,6 +783,21 @@ public class TxClient {
         delegate?.onSocketDisconnected()
     }
 
+    /// Any call that has not ended, including one in NEW. A reattach builds
+    /// the recovered Call in NEW after ATTACH has already stopped the
+    /// reconnect timeout, so for that moment isCallsActive is false although
+    /// a call is being recovered; a socket close landing there must still
+    /// keep the session. disconnect() removes every call first, so an
+    /// intended disconnect still never counts.
+    private var hasLiveCalls: Bool {
+        self.calls.values.contains {
+            if case .DONE = $0.callState {
+                return false
+            }
+            return true
+        }
+    }
+
     private var isCallsActive: Bool {
         !self.calls.filter { 
             if case .DONE = $0.value.callState {
@@ -1872,7 +1887,16 @@ extension TxClient : SocketDelegate {
                     return
                 }
                 currentCall.endForAttachCall()
-                self.socket?.disconnect(reconnect: true)
+                if let socket = self.socket {
+                    socket.disconnect(reconnect: true)
+                } else {
+                    // No socket to cycle (it closed and was released): asking
+                    // a nil socket to reconnect did nothing, and the call sat
+                    // in RECONNECTING until the timeout. Open one directly,
+                    // keeping the session so the server can reattach.
+                    Logger.log.w(message: "[CALL-RECOVERY] No signaling socket; reconnecting with the same session")
+                    self.onSocketDisconnected(reconnect: true, region: nil)
+                }
             }else {
                 Logger.log.i(message: "TxClient:: Reconnect Disabled")
             }
@@ -2031,7 +2055,7 @@ extension TxClient : SocketDelegate {
         // the call silent until the reconnect timeout ended it, while the far
         // end stayed connected. disconnect() removes every call before closing
         // the socket, so an intended disconnect never takes this path.
-        if isCallsActive {
+        if hasLiveCalls {
             Logger.log.w(message: "[CALL-RECOVERY] Socket closed during an active call; reconnecting with the same session")
             onSocketDisconnected(reconnect: true, region: region)
             return
@@ -2053,7 +2077,7 @@ extension TxClient : SocketDelegate {
         Logger.log.e(message:"TxClient:: Socket Error" +  error.localizedDescription)
         // Same as an unexpected close: a socket error during a live call must
         // lead back to the session, not end recovery.
-        if isCallsActive {
+        if hasLiveCalls {
             Logger.log.w(message: "[CALL-RECOVERY] Socket error during an active call; reconnecting with the same session")
             onSocketDisconnected(reconnect: true, region: nil)
             return
