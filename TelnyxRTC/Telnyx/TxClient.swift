@@ -2024,6 +2024,19 @@ extension TxClient : SocketDelegate {
             return
         }
 
+        // A close nobody asked for while a call is live: reconnect, keeping the
+        // session, so the server can reattach the call. Falling through here
+        // replaced the session id, and the call could then never be recovered:
+        // a socket that closed during a reattach after Wi-Fi -> cellular left
+        // the call silent until the reconnect timeout ended it, while the far
+        // end stayed connected. disconnect() removes every call before closing
+        // the socket, so an intended disconnect never takes this path.
+        if isCallsActive {
+            Logger.log.w(message: "[CALL-RECOVERY] Socket closed during an active call; reconnecting with the same session")
+            onSocketDisconnected(reconnect: true, region: region)
+            return
+        }
+
         Logger.log.i(message: "TxClient:: SocketDelegate onSocketDisconnected()")
         cleanupPendingCallKitDecline(reason: "socket disconnected before decline_push login completed")
         self.socket = nil
@@ -2037,8 +2050,15 @@ extension TxClient : SocketDelegate {
         if pendingCallDecline && !isReconnectPendingForCallKitDecline {
             cleanupPendingCallKitDecline(reason: "socket error before decline_push login completed")
         }
-        self.delegate?.onSocketDisconnected()
         Logger.log.e(message:"TxClient:: Socket Error" +  error.localizedDescription)
+        // Same as an unexpected close: a socket error during a live call must
+        // lead back to the session, not end recovery.
+        if isCallsActive {
+            Logger.log.w(message: "[CALL-RECOVERY] Socket error during an active call; reconnecting with the same session")
+            onSocketDisconnected(reconnect: true, region: nil)
+            return
+        }
+        self.delegate?.onSocketDisconnected()
     }
 
     /**
