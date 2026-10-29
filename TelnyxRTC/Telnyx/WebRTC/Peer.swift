@@ -242,6 +242,18 @@ class Peer : NSObject, WebRTCEventHandler {
         // is a nomination, not a fresh connectivity check.
         config.iceBackupCandidatePairPingInterval = 5000
 
+        // How long a selected pair may go without inbound packets, and how
+        // many failed pings over how long, before ICE gives up on it and
+        // moves to the backup. The defaults (2.5 s; 5 pings over 5 s) left
+        // libwebrtc's own fallback racing the SDK's 3 s media watch after a
+        // Wi-Fi -> cellular move, so an ICE restart fired just as the pair
+        // was about to switch and the call paid for both (6 s without
+        // audio, calls 1195 and 1197, 2026-10-29). These are timeouts on
+        // pings already being sent, not extra traffic.
+        config.iceConnectionReceivingTimeout = 1500
+        config.iceUnwritableMinChecks = NSNumber(value: 3)
+        config.iceUnwritableTimeout = NSNumber(value: 1500)
+
         let constraints = RTCMediaConstraints(mandatoryConstraints: nil,
                                               optionalConstraints: ["DtlsSrtpKeyAgreement": kRTCMediaConstraintsValueTrue])
         self.connection = Peer.factory.peerConnection(with: config, constraints: constraints, delegate: nil)

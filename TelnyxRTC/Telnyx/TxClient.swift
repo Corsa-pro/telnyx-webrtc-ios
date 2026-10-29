@@ -215,7 +215,14 @@ public class TxClient {
     /// The transport's last word on whether the current socket can carry
     /// data. A Wi-Fi socket reports false within milliseconds of the phone
     /// moving to cellular; a cellular socket stays viable when Wi-Fi comes.
+    /// Written on the transport's thread, before anything is dispatched: the
+    /// path-change handler that runs on main in the same millisecond must
+    /// see it (call 1195 kept a dead socket for 2 s because it did not).
     private var socketViable = true
+    /// When the path last changed under a live call, so a socket reported
+    /// non-viable just after it is treated as the old interface dying, not
+    /// as a flap worth waiting out.
+    private var lastPathChangeAt: Date?
     
     /// AI Assistant Manager for handling AI-related functionality
     public let aiAssistantManager = AIAssistantManager()
@@ -2161,12 +2168,18 @@ extension TxClient : SocketDelegate {
     }
 
     func onSocketViabilityChanged(viable: Bool) {
+        socketViable = viable
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.socketViable = viable
             self.viabilityWorkItem?.cancel()
             self.viabilityWorkItem = nil
             guard !viable, self.hasLiveCalls, !self.pathRecoveryInFlight else { return }
+            if let changedAt = self.lastPathChangeAt, Date().timeIntervalSince(changedAt) < 3 {
+                // The interface the socket was on has just gone: nothing to
+                // wait out.
+                self.beginPathChangeRecovery(trigger: "socket not viable after the path change", keepSignalingIfViable: false)
+                return
+            }
             // Viability flaps for a moment on a roam. Two seconds of it is
             // a path gone that the path monitor has not reported, or will
             // not: a Wi-Fi that is still "up" but carries nothing.
@@ -2198,6 +2211,7 @@ extension TxClient : SocketDelegate {
     /// invite sent down it is lost without a push.
     private func networkPathDidChange() {
         if hasLiveCalls {
+            lastPathChangeAt = Date()
             beginPathChangeRecovery(trigger: "network path changed")
         } else if socket != nil, !isCallFromPush, gatewayState == .REGED {
             Logger.log.i(message: "[CALL-RECOVERY] Path changed while idle; cycling the socket")
