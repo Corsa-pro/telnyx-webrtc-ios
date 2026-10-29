@@ -174,6 +174,16 @@ public class TxClient {
     private let reconnectQueue = DispatchQueue(label: "TelnyxClient.ReconnectQueue")
     private var _isSpeakerEnabled: Bool = false
     private var enableQualityMetrics: Bool = false
+
+    /// Quality metrics for calls this client rebuilds or answers on its own
+    /// (reattach after a network change, a pushed call answered on arrival):
+    /// on when the last CallKit answer asked for them, or when TxConfig does.
+    /// Before this, TxConfig.enableQualityMetrics was never read, so an
+    /// outbound call placed with newCall(debug: true) lost its quality metrics
+    /// and its high-RTT audio reset after a reattach.
+    private var qualityMetricsEnabled: Bool {
+        enableQualityMetrics || (txConfig?.enableQualityMetrics ?? false)
+    }
     private var isACMResetInProgress: Bool = false
     private var pendingAnonymousLoginMessage: AnonymousLoginMessage?
     private var forceRelayForNextRecoveredCall = false
@@ -1542,7 +1552,7 @@ extension TxClient {
         
         if isAttach {
             Logger.log.i(message: "TxClient :: Attaching Call....")
-            call.acceptReAttach(peer: nil,debug: enableQualityMetrics)
+            call.acceptReAttach(peer: nil,debug: qualityMetricsEnabled)
             return
         }
 
@@ -1552,7 +1562,7 @@ extension TxClient {
             if(answerCallAction != nil){
                 let pendingAction = answerCallAction
                 call.answer(customHeaders: pendingAnswerHeaders,
-                            debug: enableQualityMetrics) { [weak self] answered in
+                            debug: qualityMetricsEnabled) { [weak self] answered in
                     guard let self else { return }
                     if answered {
                         pendingAction?.fulfill()

@@ -225,6 +225,12 @@ class Peer : NSObject, WebRTCEventHandler {
         // gatherContinually will let WebRTC to listen to any network changes and send any new candidates to the other client
         config.continualGatheringPolicy = .gatherContinually
 
+        // Allow DSCP marking on outgoing packets. The audio sender's
+        // networkPriority (set in createMediaSenders) then marks audio RTP as
+        // Expedited Forwarding (46), which Wi-Fi access points queue as voice
+        // (WMM AC_VO). The OS may still clear the marking on some networks.
+        config.enableDscp = true
+
         let constraints = RTCMediaConstraints(mandatoryConstraints: nil,
                                               optionalConstraints: ["DtlsSrtpKeyAgreement": kRTCMediaConstraintsValueTrue])
         self.connection = Peer.factory.peerConnection(with: config, constraints: constraints, delegate: nil)
@@ -250,7 +256,14 @@ class Peer : NSObject, WebRTCEventHandler {
         let audioTrack = self.createAudioTrack()
         self.localAudioTrack = audioTrack
         self._localStream?.addAudioTrack(audioTrack)
-        self.connection?.add(audioTrack, streamIds: [streamId])
+        if let sender = self.connection?.add(audioTrack, streamIds: [streamId]) {
+            // High network priority maps to DSCP EF for audio when the
+            // connection was created with enableDscp.
+            let parameters = sender.parameters
+            parameters.encodings.forEach { $0.networkPriority = .high }
+            sender.parameters = parameters
+            Logger.log.i(message: "Peer:: audio sender networkPriority=high encodings=\(parameters.encodings.count)")
+        }
         self.muteUnmuteAudio(mute: false)
     }
 
