@@ -3,7 +3,10 @@ import Foundation
 import SystemConfiguration
 
 class NetworkMonitor {
-    static let shared = NetworkMonitor() // Singleton instance
+    /// Kept for callers that expect one. `TxClient` owns its own monitor: a
+    /// shared one was cancelled by whichever client deinitialised first,
+    /// after which no client heard about network changes again.
+    static let shared = NetworkMonitor()
     
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "NetworkMonitorQueue")
@@ -21,7 +24,7 @@ class NetworkMonitor {
     // Closure to notify when network state changes
     var onNetworkStateChange: ((NetworkState) -> Void)?
     
-    private init() {
+    init() {
         // Set up the path update handler
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self = self else { return }

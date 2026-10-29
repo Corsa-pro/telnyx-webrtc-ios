@@ -57,12 +57,24 @@ extension Peer {
     /// Waits for ICE candidates to be generated during ICE restart with a timeout
     /// - Parameter completion: Callback with the final SDP or error
     private func waitForICECandidatesWithTimeout(completion: @escaping (_ sdp: RTCSessionDescription?, _ error: Error?) -> Void) {
-        let timeout: TimeInterval = 5.0 // 5 seconds timeout for ICE candidates
+        // Short on purpose: the first candidates on a new interface arrive
+        // within a few hundred milliseconds, and every further second here
+        // is a second the restart offer is not on its way.
+        let timeout: TimeInterval = 2.0
         let startTime = Date()
         var lastCandidateCount = 0
         var stableCandidateCount = 0
-        let requiredStableChecks = 3 // Need 3 consecutive checks with same count to consider stable
-        
+        let requiredStableChecks = 2
+
+        // The offer's completion runs on WebRTC's signaling thread, which
+        // has no run loop to fire a Timer; the main one does.
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.waitForICECandidatesWithTimeout(completion: completion)
+            }
+            return
+        }
+
         // Check periodically if we have candidates or if ICE gathering is complete
         let timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] timer in
             guard let self = self else {

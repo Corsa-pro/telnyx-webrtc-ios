@@ -188,6 +188,30 @@ public class TxClient {
     private var pendingAnonymousLoginMessage: AnonymousLoginMessage?
     private var forceRelayForNextRecoveredCall = false
     private let forceRelayForNextRecoveredCallLock = NSLock()
+
+    /// Whether the SDK may reset the audio device module — track toggles
+    /// and an audio-session deactivate/activate cycle — on ICE
+    /// disconnect/reconnect, after an ICE restart and on sustained high
+    /// RTT. Off: under CallKit the session belongs to the app, and a second
+    /// owner of it has been the dominant failure mode; libwebrtc's own
+    /// jitter buffer sheds delay by itself.
+    public static var audioDeviceResetsEnabled = false
+
+    /// Each client watches the network itself; see `NetworkMonitor.shared`.
+    private let networkMonitor = NetworkMonitor()
+    /// The socket being replaced, kept open for messages until the new one
+    /// is registered, and the delegate that keeps it quiet meanwhile.
+    private var supersededSocket: Socket?
+    private var retiredSocketSink: RetiredSocketSink?
+    /// The next login is on a socket replacing one under a live call whose
+    /// peer is kept, so it must not ask the server to attach.
+    private var suppressAttachOnNextLogin = false
+    /// A reconnect is already waiting its buffer; a second close event for
+    /// the same loss must not open a second socket.
+    private var reconnectPending = false
+    /// A socket replacement after a path change is under way.
+    private var pathRecoveryInFlight = false
+    private var viabilityWorkItem: DispatchWorkItem?
     
     /// AI Assistant Manager for handling AI-related functionality
     public let aiAssistantManager = AIAssistantManager()
@@ -230,6 +254,11 @@ public class TxClient {
             requestReattach: { [weak self] forceRelay in
                 DispatchQueue.main.async {
                     self?.reconnectClient(forceRelayCandidateForRecovery: forceRelay)
+                }
+            },
+            didRecoverInPlace: { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.callsRecoveredInPlace()
                 }
             }
         )
@@ -366,26 +395,20 @@ public class TxClient {
         // Start monitoring audio route changes
         setupAudioRouteChangeMonitoring()
 
-        NetworkMonitor.shared.startMonitoring()
+        networkMonitor.startMonitoring()
         
         // Set up a closure to handle network state changes
-        NetworkMonitor.shared.onNetworkStateChange = { [weak self] state in
+        networkMonitor.onNetworkStateChange = { [weak self] state in
             guard let self = self else { return }
 
             DispatchQueue.main.async {
                 switch state {
                 case .wifi:
                     Logger.log.i(message: "Connected to Wi-Fi")
-                    if self.isCallsActive {
-                        self.signalingHealthMonitor.networkPathDidChange()
-                    }
-                    self.reconnectClient()
+                    self.networkPathDidChange()
                 case .cellular, .vpn:
                     Logger.log.i(message: "Connected to Cellular")
-                    if self.isCallsActive {
-                        self.signalingHealthMonitor.networkPathDidChange()
-                    }
-                    self.reconnectClient()
+                    self.networkPathDidChange()
                 case .noConnection:
                     if(!self.isCallsActive){
                         self.delegate?.onSocketDisconnected()
@@ -396,6 +419,9 @@ public class TxClient {
                     // Only start reconnect timeout if there are active calls
                     if self.isCallsActive {
                         self.startReconnectTimeout()
+                        if let call = self.liveCall {
+                            self.signalingHealthMonitor.networkDidDrop(for: call)
+                        }
                     }
                 }
             }
@@ -409,7 +435,9 @@ public class TxClient {
         reconnectTimeoutTimer = nil
         
         // Stop network monitoring
-        NetworkMonitor.shared.stopMonitoring()
+        networkMonitor.stopMonitoring()
+        supersededSocket?.delegate = nil
+        supersededSocket?.disconnect(reconnect: false)
         
         // Remove audio route change observer
         NotificationCenter.default.removeObserver(self, name: AVAudioSession.routeChangeNotification, object: nil)
@@ -606,6 +634,7 @@ public class TxClient {
         self.txConfig = txConfig
 
         self.serverConfiguration = serverConfigurationForConnection(serverConfiguration)
+        retireCurrentSocket()
         self.socket = Socket()
         self.socket?.delegate = self
         self.aiAssistantManager.setSocket(self.socket)
@@ -629,6 +658,7 @@ public class TxClient {
                                                          pushMetaData: self.pushMetaData)
 
         Logger.log.i(message: "TxClient:: serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
+        retireCurrentSocket()
         self.socket = Socket()
         self.socket?.delegate = self
         self.aiAssistantManager.setSocket(self.socket)
@@ -669,6 +699,7 @@ public class TxClient {
         self.serverConfiguration = serverConfiguration
 
         Logger.log.i(message: "TxClient:: serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
+        retireCurrentSocket()
         self.socket = Socket()
         self.socket?.delegate = self
         self.socket?.connect(signalingServer: self.serverConfiguration.signalingServer)
@@ -779,6 +810,11 @@ public class TxClient {
         // caused the speaker / audio-route state to stop tracking route changes
         // after every disconnect (see IOS-C26 / VSDK-337). Observer cleanup is
         // exclusively handled in `deinit`.
+        closeSupersededSocket()
+        pathRecoveryInFlight = false
+        suppressAttachOnNextLogin = false
+        viabilityWorkItem?.cancel()
+        viabilityWorkItem = nil
         socket?.disconnect(reconnect: false)
         delegate?.onSocketDisconnected()
     }
@@ -1184,7 +1220,8 @@ public class TxClient {
             Logger.log.i(message: "TxClient:: anonymousLogin() serverConfiguration server: [\(self.serverConfiguration.signalingServer)] ICE Servers [\(self.serverConfiguration.webRTCIceServers)]")
             
             // Initialize socket and start connection
-            self.socket = Socket()
+            retireCurrentSocket()
+        self.socket = Socket()
             self.socket?.delegate = self
             self.aiAssistantManager.setSocket(self.socket)
             self.socket?.connect(signalingServer: self.serverConfiguration.signalingServer)
@@ -1260,6 +1297,7 @@ public class TxClient {
                     return
                 }
                 
+                self.completeSocketReplacement()
                 self.delegate?.onClientReady()
                 //Check if isCallFromPush and sendAttachCall Message
                 if (self.isCallFromPush == true){
@@ -1869,6 +1907,10 @@ extension TxClient : SocketDelegate {
     }
    
     func reconnectClient(forceRelayCandidateForRecovery: Bool = false) {
+        // The reattach replaces the peer, so its login must ask the server
+        // to attach, and any socket swap in progress is superseded.
+        pathRecoveryInFlight = false
+        suppressAttachOnNextLogin = false
         forceRelayForNextRecoveredCallLock.lock()
         forceRelayForNextRecoveredCall = forceRelayCandidateForRecovery
         forceRelayForNextRecoveredCallLock.unlock()
@@ -1981,6 +2023,11 @@ extension TxClient : SocketDelegate {
         let pushToken = self.txConfig?.pushNotificationConfig?.pushDeviceToken
         let pushProvider = self.txConfig?.pushNotificationConfig?.pushNotificationProvider
 
+        // One login per decision: a socket replacing one under a kept peer
+        // does not ask the server to attach the call.
+        let attachCall = !suppressAttachOnNextLogin
+        suppressAttachOnNextLogin = false
+
         //Login into the signaling server after the connection is produced.
         if let token = self.txConfig?.token  {
             Logger.log.i(message: "TxClient:: SocketDelegate onSocketConnected() login with Token")
@@ -1991,7 +2038,8 @@ extension TxClient : SocketDelegate {
                                           sessionId: self.sessionId!,
                                           declinePush: false,
                                           enableMissedCallNotifications: self.txConfig?.enableMissedCallNotifications ?? false,
-                                          pushWhenActive: self.txConfig?.pushWhenActive ?? false)
+                                          pushWhenActive: self.txConfig?.pushWhenActive ?? false,
+                                          attachCall: attachCall)
             self.socket?.sendMessage(message: vertoLogin.encode())
         } else {
             Logger.log.i(message: "TxClient:: SocketDelegate onSocketConnected() login with SIP User and Password")
@@ -2007,18 +2055,25 @@ extension TxClient : SocketDelegate {
                                           sessionId: self.sessionId!,
                                           declinePush: false,
                                           enableMissedCallNotifications: self.txConfig?.enableMissedCallNotifications ?? false,
-                                          pushWhenActive: self.txConfig?.pushWhenActive ?? false)
+                                          pushWhenActive: self.txConfig?.pushWhenActive ?? false,
+                                          attachCall: attachCall)
             self.socket?.sendMessage(message: vertoLogin.encode())
         }
     }
     
     func onSocketDisconnected(reconnect: Bool, region: Region?) {
         if reconnect {
+            guard !reconnectPending else {
+                Logger.log.i(message: "TxClient:: SocketDelegate reconnect already scheduled")
+                return
+            }
+            reconnectPending = true
             Logger.log.i(message: "TxClient:: SocketDelegate  Reconnecting")
             if pendingCallDecline {
                 isReconnectPendingForCallKitDecline = true
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + TxClient.RECONNECT_BUFFER) {
+                self.reconnectPending = false
                 do {
                     var updatedServerConfig = self.serverConfiguration
 
@@ -2083,6 +2138,149 @@ extension TxClient : SocketDelegate {
             return
         }
         self.delegate?.onSocketDisconnected()
+    }
+
+    func onSocketViabilityChanged(viable: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.viabilityWorkItem?.cancel()
+            self.viabilityWorkItem = nil
+            guard !viable, self.hasLiveCalls, !self.pathRecoveryInFlight else { return }
+            // Viability flaps for a moment on a roam. Two seconds of it is
+            // a path gone that the path monitor has not reported, or will
+            // not: a Wi-Fi that is still "up" but carries nothing.
+            let item = DispatchWorkItem { [weak self] in
+                guard let self = self, self.hasLiveCalls, !self.pathRecoveryInFlight else { return }
+                self.beginPathChangeRecovery(trigger: "socket not viable for 2s")
+            }
+            self.viabilityWorkItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: item)
+        }
+    }
+
+    func onSocketReconnectSuggested() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if self.hasLiveCalls {
+                self.beginPathChangeRecovery(trigger: "transport suggests a better path")
+            } else if self.gatewayState == .REGED, !self.isCallFromPush {
+                self.socket?.disconnect(reconnect: true)
+            }
+        }
+    }
+
+    // MARK: - Path changes
+
+    /// A usable path appeared or changed. With a live call the peer is kept
+    /// and only the socket is replaced. Idle, the socket is cycled: one left
+    /// on an interface that is gone still looks open to the server, and an
+    /// invite sent down it is lost without a push.
+    private func networkPathDidChange() {
+        if hasLiveCalls {
+            beginPathChangeRecovery(trigger: "network path changed")
+        } else if socket != nil, !isCallFromPush, gatewayState == .REGED {
+            Logger.log.i(message: "[CALL-RECOVERY] Path changed while idle; cycling the socket")
+            socket?.disconnect(reconnect: true)
+        }
+    }
+
+    /// The call a recovery is about: the current one if it is live, else
+    /// any live one.
+    private var liveCall: Call? {
+        func isLive(_ call: Call) -> Bool {
+            if case .DONE = call.callState {
+                return false
+            }
+            return true
+        }
+        if let call = calls[currentCallId], isLive(call) {
+            return call
+        }
+        return calls.values.first(where: isLive)
+    }
+
+    /// Keeps the peer and replaces the signaling socket with the same
+    /// session. The monitor takes it from there: media that heals by itself
+    /// ends the recovery once the new socket is registered, otherwise ICE
+    /// restarts over it, and the reattach (`reconnectClient`) stays the last
+    /// resort. The login on the new socket does not ask the server to
+    /// attach; if the server attaches regardless, the kept peer is released
+    /// in favour of the attached one.
+    private func beginPathChangeRecovery(trigger: String) {
+        guard txConfig?.reconnectClient == true else {
+            Logger.log.i(message: "TxClient:: Reconnect Disabled")
+            return
+        }
+        guard let call = liveCall else { return }
+        guard !pathRecoveryInFlight else {
+            Logger.log.i(message: "[CALL-RECOVERY] \(trigger); the socket is already being replaced")
+            return
+        }
+        Logger.log.w(message: "[CALL-RECOVERY] \(trigger): keeping the peer, replacing the socket")
+        pathRecoveryInFlight = true
+        suppressAttachOnNextLogin = true
+        updateActiveCallsState(callState: CallState.RECONNECTING(reason: .networkSwitch))
+        startReconnectTimeout()
+        signalingHealthMonitor.networkPathDidChange(for: call)
+        guard let config = txConfig ?? storedTxConfig else {
+            Logger.log.e(message: "[CALL-RECOVERY] No configuration to reconnect with")
+            return
+        }
+        do {
+            try connect(txConfig: config, serverConfiguration: serverConfiguration)
+        } catch {
+            Logger.log.e(message: "[CALL-RECOVERY] Reconnect failed: \(error.localizedDescription)")
+            onSocketDisconnected(reconnect: true, region: nil)
+        }
+    }
+
+    /// The socket being replaced stays open for messages until the new one
+    /// registers; see `RetiredSocketSink`.
+    private func retireCurrentSocket() {
+        guard let old = socket else { return }
+        closeSupersededSocket()
+        let sink = RetiredSocketSink(client: self)
+        old.delegate = sink
+        retiredSocketSink = sink
+        supersededSocket = old
+    }
+
+    private func closeSupersededSocket() {
+        guard let old = supersededSocket else { return }
+        supersededSocket = nil
+        retiredSocketSink = nil
+        old.delegate = nil
+        old.disconnect(reconnect: false)
+    }
+
+    /// Runs on REGED. Closes the socket that was replaced, points live calls
+    /// at the new one and, if a path change started this, lets the monitor
+    /// decide whether the kept peer needs an ICE restart.
+    private func completeSocketReplacement() {
+        closeSupersededSocket()
+        guard let socket = socket else { return }
+        for call in calls.values where call.socket !== socket {
+            call.rebindSocket(socket)
+        }
+        if pathRecoveryInFlight {
+            pathRecoveryInFlight = false
+            signalingHealthMonitor.signalingDidReconnect()
+        }
+    }
+
+    /// The kept peer carries the call again: back to ACTIVE, as a reattach
+    /// would report, and the reconnect clock stops.
+    private func callsRecoveredInPlace() {
+        stopReconnectTimeout()
+        for call in calls.values {
+            switch call.callState {
+            case .RECONNECTING, .DROPPED:
+                Logger.log.i(message: "[CALL-RECOVERY] Call recovered on its own peer")
+                call.updateCallState(callState: .ACTIVE)
+            default:
+                break
+            }
+        }
     }
 
     /**
@@ -2308,6 +2506,14 @@ extension TxClient : SocketDelegate {
                     }
 
                     Logger.log.i(message: "isAudioEnabled : \(self.isAudioDeviceEnabled)")
+                    if let kept = self.calls[uuid], kept.peer != nil {
+                        // The server attached the call while its peer was
+                        // being kept through a path change: the attached leg
+                        // is the call now.
+                        Logger.log.i(message: "[CALL-RECOVERY] Server attached the call; releasing the kept peer")
+                        kept.endForAttachCall()
+                    }
+                    self.pathRecoveryInFlight = false
                     self.createIncomingCall(callerName: callerName,
                                             callerNumber: callerNumber,
                                             callId: uuid,

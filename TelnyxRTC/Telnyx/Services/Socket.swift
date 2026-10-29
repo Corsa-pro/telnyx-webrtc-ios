@@ -193,9 +193,17 @@ extension Socket : WebSocketDelegate {
             break
         case .pong(_):
             break
-        case .viabilityChanged(_):
+        case .viabilityChanged(let viable):
+            // From the connection itself, ahead of any timeout: the path
+            // under this socket can or cannot carry data.
+            Logger.log.i(message: "Socket:: viability changed: \(viable)")
+            self.delegate?.onSocketViabilityChanged(viable: viable)
             break
-        case .reconnectSuggested(_):
+        case .reconnectSuggested(let suggested):
+            Logger.log.i(message: "Socket:: reconnect suggested: \(suggested)")
+            if suggested {
+                self.delegate?.onSocketReconnectSuggested()
+            }
             break
         case .peerClosed:
             break

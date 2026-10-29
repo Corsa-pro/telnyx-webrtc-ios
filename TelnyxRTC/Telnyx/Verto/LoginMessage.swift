@@ -22,7 +22,8 @@ class LoginMessage : Message {
          sessionId:String,
          declinePush: Bool = false,
          enableMissedCallNotifications: Bool = false,
-         pushWhenActive: Bool = false
+         pushWhenActive: Bool = false,
+         attachCall: Bool = true
     ) {
 
         var params = [String: Any]()
@@ -66,7 +67,11 @@ class LoginMessage : Message {
       
         
         var loginParams = [String: Any]()
-        loginParams["attach_call"] = true.description
+        // Omitted, not false, when the caller keeps its peer through a
+        // reconnect: the server is then not asked to attach the call.
+        if attachCall {
+            loginParams["attach_call"] = true.description
+        }
         if declinePush {
             loginParams["decline_push"] = true.description
         }
@@ -87,7 +92,8 @@ class LoginMessage : Message {
          sessionId:String,
          declinePush: Bool = false,
          enableMissedCallNotifications: Bool = false,
-         pushWhenActive: Bool = false
+         pushWhenActive: Bool = false,
+         attachCall: Bool = true
     ) {
         var params = [String: Any]()
         params["login_token"] = token
@@ -95,7 +101,11 @@ class LoginMessage : Message {
         params["from_push"] = startFromPush
         params["sessid"] = sessionId
         var loginParams = [String: Any]()
-        loginParams["attach_call"] = true.description
+        // Omitted, not false, when the caller keeps its peer through a
+        // reconnect: the server is then not asked to attach the call.
+        if attachCall {
+            loginParams["attach_call"] = true.description
+        }
         if declinePush {
             loginParams["decline_push"] = true
         }

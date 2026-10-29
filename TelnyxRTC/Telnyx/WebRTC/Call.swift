@@ -741,6 +741,20 @@ public class Call {
         self.peer?.dispose()
     }
 
+    /// Points the call at a replacement signaling socket. The session is the
+    /// same, so hold, DTMF, trickle candidates and an ICE-restart offer must
+    /// go down the new socket, and the debug stats report carries on under
+    /// its id, as it does across a reattach.
+    internal func rebindSocket(_ socket: Socket) {
+        self.socket = socket
+        self.peer?.socket = socket
+        guard let reporter = statsReporter else { return }
+        let reportId = reporter.reportId
+        reporter.dispose()
+        configureStatsReporter(reportID: reportId)
+        startStatsReporter()
+    }
+
     /// Checks whether the selected local ICE candidate is a non-relay VPN path.
     /// This is evaluated only after a peer failure and only affects the replacement
     /// call created by reconnect/reattach.
@@ -1878,6 +1892,12 @@ extension Call {
             Logger.log.i(message: "[ACM_RESET] Call:: First ICE connection established - ACM reset disabled for initial connection")
         }
 
+        // The resets below toggle the tracks and cycle the audio session.
+        // Under CallKit the session belongs to the app, and a peer that is
+        // kept through a network change goes disconnected and back as a
+        // matter of course; see `TxClient.audioDeviceResetsEnabled`.
+        guard TxClient.audioDeviceResetsEnabled else { return }
+
         // Case 2: connected -> disconnected: Reset audio buffers (only on reconnection)
         if previousState == .connected && newState == .disconnected && hasBeenConnectedBefore {
             Logger.log.w(message: "[ACM_RESET] Call:: ICE connection disconnected during active call - resetting audio buffers")
@@ -1954,6 +1974,8 @@ extension Call {
         }
 
         currentRttMs = metrics.rtt * 1000 // Convert to milliseconds and store
+
+        guard TxClient.audioDeviceResetsEnabled else { return }
 
         Logger.log.i(message: "[RTT] Call:: Current RTT: \(String(format: "%.1f", currentRttMs))ms")
 

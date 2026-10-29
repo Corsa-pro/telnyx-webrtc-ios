@@ -1,6 +1,20 @@
 import Foundation
 import WebRTC
 
+private extension CallState {
+    /// States in which the media can be renegotiated: up, held, or being
+    /// recovered after a network change — a restart is how a kept peer is
+    /// moved onto the new path.
+    var allowsIceRestart: Bool {
+        switch self {
+        case .ACTIVE, .CONNECTING, .HELD, .RECONNECTING, .DROPPED:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 // MARK: - ICE Restart handling
 extension Call {
 
@@ -47,7 +61,7 @@ extension Call {
         }
         
         // Check if call is in a valid state for ICE restart
-        guard self.callState == .ACTIVE || self.callState == .CONNECTING else {
+        guard self.callState.allowsIceRestart else {
             Logger.log.w(message: "[ICE-RESTART] Call:: ICE restart skipped - call not in active state: \(self.callState)")
             recordIceRestartEvent(
                 level: "warn",
@@ -200,7 +214,7 @@ extension Call {
             } else {
                 
                 // Reset audio to clear jitter buffers after successful ICE restart
-                if self.shouldResetAudioAfterIceRestart {
+                if self.shouldResetAudioAfterIceRestart && TxClient.audioDeviceResetsEnabled {
                     Logger.log.i(message: "[ICE-RESTART] Call:: Resetting audio to clear jitter buffers after ICE restart with preserved speaker state")
                     self.resetAudioDeviceWithNetworkState()
                 }

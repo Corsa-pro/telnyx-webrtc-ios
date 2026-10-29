@@ -190,6 +190,11 @@ class Peer : NSObject, WebRTCEventHandler {
     // The `RTCPeerConnectionFactory` is in charge of creating new RTCPeerConnection instances.
     // A new RTCPeerConnection should be created every new call, but the factory is shared.
     internal static let factory: RTCPeerConnectionFactory = {
+        // libwebrtc's own network monitor on iOS is behind this trial. With
+        // it, an interface going away or appearing reaches ICE at once,
+        // instead of being found by the next failed ping, so a call moves to
+        // the surviving path in well under a second.
+        RTCInitFieldTrialDictionary(["WebRTC-Network-UseNWPathMonitor": kRTCFieldTrialEnabledValue])
         RTCInitializeSSL()
         let videoEncoderFactory = RTCDefaultVideoEncoderFactory()
         let videoDecoderFactory = RTCDefaultVideoDecoderFactory()
@@ -230,6 +235,12 @@ class Peer : NSObject, WebRTCEventHandler {
         // Expedited Forwarding (46), which Wi-Fi access points queue as voice
         // (WMM AC_VO). The OS may still clear the marking on some networks.
         config.enableDscp = true
+
+        // Keep the pair on the other interface warm. With Wi-Fi selected the
+        // cellular pair is a backup that libwebrtc pings every 25 s by
+        // default; at 5 s it is known good when Wi-Fi goes, and the switch
+        // is a nomination, not a fresh connectivity check.
+        config.iceBackupCandidatePairPingInterval = 5000
 
         let constraints = RTCMediaConstraints(mandatoryConstraints: nil,
                                               optionalConstraints: ["DtlsSrtpKeyAgreement": kRTCMediaConstraintsValueTrue])
