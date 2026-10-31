@@ -863,7 +863,25 @@ extension Call {
     /// ### Example:
     ///     call.hangup()
     public func hangup() {
-        Logger.log.i(message: "Call:: hangup()")
+        hangup(cause: nil)
+    }
+
+    /// Ends an unanswered call this device will not take, without reporting a
+    /// decline.
+    ///
+    /// `hangup()` on a ringing call sends USER_BUSY, which the far side renders
+    /// as SIP 486 — the code a user's tap produces, and the one a server may
+    /// act on ("decline on one device stops the others"). Teardowns with no
+    /// user behind them — the app going to the background with a ring it
+    /// never showed, a signed-out device refusing a push, `disconnect()` on
+    /// a pending push — must not look like that. NO_ANSWER renders as 480,
+    /// "this device could not take it". Corsa fork, 2026-10-30.
+    public func abandon() {
+        hangup(cause: .NO_ANSWER)
+    }
+
+    func hangup(cause override: CauseCode?) {
+        Logger.log.i(message: "Call:: hangup() cause=\(override.map { String(describing: $0) } ?? "auto")")
         guard let sessionId = self.sessionId else { return }
         
         // Create a termination reason for local hangup
@@ -875,7 +893,7 @@ extension Call {
         case .ACTIVE, .HELD:
             causeCode = .NORMAL_CLEARING
         case .NEW, .RINGING, .CONNECTING:
-            causeCode = .USER_BUSY
+            causeCode = override ?? .USER_BUSY
         default:
             causeCode = .NORMAL_CLEARING
         }

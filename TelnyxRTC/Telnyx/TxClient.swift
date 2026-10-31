@@ -803,9 +803,18 @@ public class TxClient {
         self.registerRetryCount = TxClient.MAX_REGISTER_RETRY
         self.gatewayState = .NOREG
 
-        // Let's cancell all the current calls
+        // Let's cancell all the current calls. A call that was never answered
+        // is abandoned (NO_ANSWER → 480), not declined (USER_BUSY → 486):
+        // nobody tapped anything, and a server that syncs declines across a
+        // user's devices must not read this as one (Corsa, 2026-10-30, call
+        // 1243: a second push made this path send 486 for the first leg).
         for (_ ,call) in self.calls {
-            call.hangup()
+            switch call.callState {
+            case .NEW, .RINGING, .CONNECTING:
+                call.abandon()
+            default:
+                call.hangup()
+            }
         }
         self.calls.removeAll()
         self.socketToAppCallId.removeAll()

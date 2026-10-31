@@ -14,6 +14,10 @@ enum CauseCode : Int {
     // General Hangup Reasons
     case NORMAL_CLEARING = 16
     case USER_BUSY = 17
+    /// The device never took the call — no user action. Telnyx renders it as
+    /// SIP 480, which the server side must not read as a decline (USER_BUSY
+    /// is a tap; see Call.abandon()).
+    case NO_ANSWER = 19
     case CALL_REJECTED = 21
     case UNALLOCATED_NUMBER = 1
     case INCOMPATIBLE_DESTINATION = 88
@@ -60,6 +64,7 @@ class ByeMessage : Message {
     internal static func getCauseFromCode(causeCode: CauseCode) -> String {
         switch(causeCode) {
         case .USER_BUSY: return "USER_BUSY"
+        case .NO_ANSWER: return "NO_ANSWER"
         case .NORMAL_CLEARING: return "NORMAL_CLEARING"
         case .CALL_REJECTED: return "CALL_REJECTED"
         case .UNALLOCATED_NUMBER: return "UNALLOCATED_NUMBER"
