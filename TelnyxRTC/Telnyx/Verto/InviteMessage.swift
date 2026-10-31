@@ -25,7 +25,13 @@ class InviteMessage : Message {
         dialogParams["destination_number"] = callOptions.destinationNumber
         dialogParams["remote_caller_id_name"] = callOptions.remoteCallerName
         dialogParams["caller_id_name"] = callInfo.callerName
-        dialogParams["caller_id_number"] = callInfo.callerNumber
+        // Omitted when empty: an internal extension call must carry no caller
+        // number, so the callee sees the caller's own extension and CNAM rather
+        // than the line's public number (Odoo/Corsa, 2026-10-31). An empty
+        // string would be sent as "" and is not "absent".
+        if let callerNumber = callInfo.callerNumber, !callerNumber.isEmpty {
+            dialogParams["caller_id_number"] = callerNumber
+        }
         dialogParams["audio"] = callOptions.audio
         dialogParams["video"] = callOptions.video
         dialogParams["useStereo"] = callOptions.useStereo
