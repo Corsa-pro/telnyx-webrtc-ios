@@ -83,4 +83,15 @@ public protocol TxClientDelegate: AnyObject {
     /// This is specifically for handling calls that arrive via push notifications
     /// when the app is in the background.
     func onPushCall(call: Call)
+
+    /// A push call that was ringing lost its signaling socket to a network
+    /// change. The server cannot move a ringing call to another socket, so
+    /// the SDK has let go of it without telling the server anything; the
+    /// app keeps its CallKit ring and asks its own server to ring this
+    /// device again. Fork addition (Corsa).
+    func onRingingCallStranded(callId: UUID)
+}
+
+public extension TxClientDelegate {
+    func onRingingCallStranded(callId: UUID) {}
 }

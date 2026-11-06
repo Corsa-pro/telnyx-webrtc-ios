@@ -2193,7 +2193,7 @@ extension TxClient : SocketDelegate {
         // the call silent until the reconnect timeout ended it, while the far
         // end stayed connected. disconnect() removes every call before closing
         // the socket, so an intended disconnect never takes this path.
-        if hasLiveCalls, ringingInboundCall != nil, replayRingingPushCall(trigger: "socket closed") {
+        if hasLiveCalls, ringingInboundCall != nil, strandRingingPushCall(trigger: "socket closed") {
             return
         }
         if hasLiveCalls {
@@ -2218,7 +2218,7 @@ extension TxClient : SocketDelegate {
         Logger.log.e(message:"TxClient:: Socket Error" +  error.localizedDescription)
         // Same as an unexpected close: a socket error during a live call must
         // lead back to the session, not end recovery.
-        if hasLiveCalls, ringingInboundCall != nil, replayRingingPushCall(trigger: "socket error") {
+        if hasLiveCalls, ringingInboundCall != nil, strandRingingPushCall(trigger: "socket error") {
             return
         }
         if hasLiveCalls {
@@ -2306,32 +2306,32 @@ extension TxClient : SocketDelegate {
         }
     }
 
-    /// Moves a ringing push call to a new path by having it offered again.
+    /// Lets go of a ringing push call whose socket the network took away.
     ///
-    /// The server reattaches an answered call to a new socket, not a ringing
-    /// one: replacing the socket under an unanswered call left it on the old
-    /// one, and the answer that followed got CALL DOES NOT EXIST while the
-    /// user's other devices rang on (Corsa, 2026-11-06 10:17, Wi-Fi off
-    /// mid-ring). So the call is dropped here, silently - CallKit keeps
-    /// ringing, the app is not told - and the push login is run again on a
-    /// fresh socket, which is what makes the server offer a push call. An
-    /// answer or decline in the meantime takes the push flow's own
-    /// before-the-INVITE path.
-    private func replayRingingPushCall(trigger: String) -> Bool {
-        guard txConfig?.reconnectClient == true,
-              answerCallAction == nil, !pendingCallDecline,
+    /// The server reattaches an answered call to a new socket, never a ringing
+    /// one: the leg stays bound to the socket its INVITE went down (Telnyx
+    /// support, 2026-11-06). Replacing the socket under it left a ring that
+    /// could not be answered, and a fresh push login with `attach_call` was
+    /// not offered the call either (Corsa, 2026-11-06, two tests). So the call
+    /// is dropped here with nothing sent, the socket is closed, and the app is
+    /// told; it keeps the CallKit ring and has its server ring this device
+    /// again, which arrives as a new push on the new network. A socket that is
+    /// still viable is kept, and the call with it.
+    private func strandRingingPushCall(trigger: String) -> Bool {
+        guard answerCallAction == nil, !pendingCallDecline,
               let ringing = ringingInboundCall,
               let callUUID = ringing.callInfo?.callId,
-              isCallFromPush || callUUID == pushOfferedCallId,
-              let serverConfiguration = storedServerConfiguration else {
+              isCallFromPush || callUUID == pushOfferedCallId else {
             return false
         }
-        Logger.log.w(message: "[CALL-RECOVERY] \(trigger) while ringing: logging in again so the call is offered on the new path")
+        Logger.log.w(message: "[CALL-RECOVERY] \(trigger) while ringing: a ringing call cannot move sockets; releasing it for a re-ring")
         ringing.endForAttachCall()
         calls.removeValue(forKey: callUUID)
         if ringing.signalingCallId != callUUID {
             socketToAppCallId.removeValue(forKey: ringing.signalingCallId)
         }
+        releaseActiveCall(callUUID)
+        pushOfferedCallId = nil
         viabilityWorkItem?.cancel()
         viabilityWorkItem = nil
         idlePathCycleWorkItem?.cancel()
@@ -2339,39 +2339,15 @@ extension TxClient : SocketDelegate {
         pathRecoveryInFlight = false
         suppressAttachOnNextLogin = false
         stopReconnectTimeout()
+        resetPushVariables()
         closeSupersededSocket()
+        gatewayState = .NOREG
         socket?.delegate = nil
         socket?.disconnect(reconnect: false)
         socket = nil
         sessionId = UUID().uuidString.lowercased()
-        pushCallState = .idle
-        isCallFromPush = true
-        do {
-            try connectSocketOnly(serverConfiguration: serverConfiguration)
-        } catch {
-            Logger.log.e(message: "[CALL-RECOVERY] Ring replay could not connect: \(error.localizedDescription)")
-            return true
-        }
-        if let socket = socket {
-            calls[callUUID] = Call(callId: callUUID,
-                                   remoteSdp: "",
-                                   sessionId: callUUID.uuidString.lowercased(),
-                                   socket: socket,
-                                   delegate: self,
-                                   iceServers: serverConfiguration.webRTCIceServers,
-                                   debug: txConfig?.debug ?? false,
-                                   forceRelayCandidate: txConfig?.forceRelayCandidate ?? false,
-                                   sendWebRTCStatsViaSocket: txConfig?.sendWebRTCStatsViaSocket ?? false,
-                                   useTrickleIce: txConfig?.useTrickleIce ?? false,
-                                   enableMissedCallNotifications: txConfig?.enableMissedCallNotifications ?? false,
-                                   enableCallReports: txConfig?.enableCallReports ?? true,
-                                   callReportInterval: txConfig?.callReportInterval ?? 5.0,
-                                   callReportLogLevel: txConfig?.callReportLogLevel ?? "debug",
-                                   callReportMaxLogEntries: txConfig?.callReportMaxLogEntries ?? 1000,
-                                   pushWhenActive: storedTxConfig?.pushWhenActive ?? false,
-                                   pushDeviceToken: storedTxConfig?.pushNotificationConfig?.pushDeviceToken)
-            currentCallId = callUUID
-        }
+        delegate?.onSocketDisconnected()
+        delegate?.onRingingCallStranded(callId: callUUID)
         return true
     }
 
@@ -2410,7 +2386,7 @@ extension TxClient : SocketDelegate {
                 Logger.log.i(message: "[CALL-RECOVERY] \(trigger) while ringing: socket still viable, keeping it")
                 return
             }
-            if replayRingingPushCall(trigger: trigger) {
+            if strandRingingPushCall(trigger: trigger) {
                 return
             }
         }
