@@ -206,6 +206,9 @@ public class TxClient {
     /// A pending "path changed while idle" socket cycle, held back a moment
     /// so a push arriving on the same wake can claim the socket first.
     private var idlePathCycleWorkItem: DispatchWorkItem?
+    /// The call a push offered, while it rings. `isCallFromPush` is cleared
+    /// the moment the INVITE is handed to the app, so it cannot say this.
+    private var pushOfferedCallId: UUID?
     /// The next login is on a socket replacing one under a live call whose
     /// peer is kept, so it must not ask the server to attach.
     private var suppressAttachOnNextLogin = false
@@ -1674,6 +1677,7 @@ extension TxClient {
         }
 
         if isCallFromPush {
+            pushOfferedCallId = call.callInfo?.callId
             self.delegate?.onPushCall(call: call)
             //Answer is pending from push - Answer Call
             if(answerCallAction != nil){
@@ -1868,6 +1872,9 @@ extension TxClient: CallProtocol {
                 socketToAppCallId.removeValue(forKey: call.signalingCallId)
             }
             releaseActiveCall(callId)
+            if pushOfferedCallId == callId {
+                pushOfferedCallId = nil
+            }
             // Nothing left to recover: a reconnect timeout still armed would
             // fire into whatever comes next. One armed for a push call that
             // had already ended fired 44 s later as "Call reconnection
@@ -2312,9 +2319,10 @@ extension TxClient : SocketDelegate {
     /// before-the-INVITE path.
     private func replayRingingPushCall(trigger: String) -> Bool {
         guard txConfig?.reconnectClient == true,
-              isCallFromPush, answerCallAction == nil, !pendingCallDecline,
+              answerCallAction == nil, !pendingCallDecline,
               let ringing = ringingInboundCall,
               let callUUID = ringing.callInfo?.callId,
+              isCallFromPush || callUUID == pushOfferedCallId,
               let serverConfiguration = storedServerConfiguration else {
             return false
         }
@@ -2337,6 +2345,7 @@ extension TxClient : SocketDelegate {
         socket = nil
         sessionId = UUID().uuidString.lowercased()
         pushCallState = .idle
+        isCallFromPush = true
         do {
             try connectSocketOnly(serverConfiguration: serverConfiguration)
         } catch {
