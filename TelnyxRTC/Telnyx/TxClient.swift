@@ -838,7 +838,22 @@ public class TxClient {
         suppressAttachOnNextLogin = false
         viabilityWorkItem?.cancel()
         viabilityWorkItem = nil
+        // Detached first: this socket is finished with, and its late close or
+        // error must not be read as news about whichever socket replaces it.
+        // A push tears down the dead background socket here and opens a new
+        // one; the old one's error 53 arrived milliseconds later, after the
+        // push's placeholder call existed, and was taken for "a socket error
+        // during an active call" - a second login on a second socket, and
+        // Telnyx dropped the leg as DESTINATION_OUT_OF_ORDER once the INVITE
+        // landed (Corsa, 2026-11-05, three calls on one phone).
+        socket?.delegate = nil
         socket?.disconnect(reconnect: false)
+        // What the close callback used to do once it arrived, done here now
+        // that it no longer can: forget the socket and start a new session.
+        // It also used to tell the app a second time, as an unintended
+        // disconnect, after this method had told it once as intended.
+        socket = nil
+        sessionId = UUID().uuidString.lowercased()
         delegate?.onSocketDisconnected()
     }
 
@@ -848,13 +863,25 @@ public class TxClient {
     /// a call is being recovered; a socket close landing there must still
     /// keep the session. disconnect() removes every call first, so an
     /// intended disconnect still never counts.
+    ///
+    /// Not the placeholder a push creates before its INVITE: there is no peer
+    /// to keep and nothing to reattach, and the push flow owns the socket
+    /// until the INVITE lands. Counting it made a path change during the push
+    /// login replace that socket, and the INVITE then landed as the old one
+    /// closed (Corsa, 2026-11-05, call 164; the same as 2026-10-30 call 1247).
     private var hasLiveCalls: Bool {
         self.calls.values.contains {
             if case .DONE = $0.callState {
                 return false
             }
-            return true
+            return !isPushPlaceholder($0)
         }
+    }
+
+    /// The call object a push makes so an early BYE has somewhere to land,
+    /// before any INVITE has given it an offer.
+    private func isPushPlaceholder(_ call: Call) -> Bool {
+        isCallFromPush && pushCallState != .inviteReceived && (call.remoteSdp ?? "").isEmpty
     }
 
     private var isCallsActive: Bool {
@@ -1836,6 +1863,14 @@ extension TxClient: CallProtocol {
                 socketToAppCallId.removeValue(forKey: call.signalingCallId)
             }
             releaseActiveCall(callId)
+            // Nothing left to recover: a reconnect timeout still armed would
+            // fire into whatever comes next. One armed for a push call that
+            // had already ended fired 44 s later as "Call reconnection
+            // failed", just as the next call's push arrived (Corsa,
+            // 2026-11-05, calls 164 and 165).
+            if !hasLiveCalls {
+                stopReconnectTimeout()
+            }
 
             // Clear AI Assistant transcriptions when call ends
             self.aiAssistantManager.clearTranscriptions()
@@ -2235,7 +2270,7 @@ extension TxClient : SocketDelegate {
             if case .DONE = call.callState {
                 return false
             }
-            return true
+            return !isPushPlaceholder(call)
         }
         if let call = calls[currentCallId], isLive(call) {
             return call
