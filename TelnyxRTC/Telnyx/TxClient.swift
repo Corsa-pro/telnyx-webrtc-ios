@@ -209,6 +209,9 @@ public class TxClient {
     /// The call a push offered, while it rings. `isCallFromPush` is cleared
     /// the moment the INVITE is handed to the app, so it cannot say this.
     private var pushOfferedCallId: UUID?
+    /// The push call whose login was redone on a new socket, until its
+    /// INVITE arrives.
+    private var redonePushCallId: UUID?
     /// The next login is on a socket replacing one under a live call whose
     /// peer is kept, so it must not ask the server to attach.
     private var suppressAttachOnNextLogin = false
@@ -1678,6 +1681,7 @@ extension TxClient {
 
         if isCallFromPush {
             pushOfferedCallId = call.callInfo?.callId
+            redonePushCallId = nil
             self.delegate?.onPushCall(call: call)
             //Answer is pending from push - Answer Call
             if(answerCallAction != nil){
@@ -1851,6 +1855,26 @@ extension TxClient: CallProtocol {
 
     func callStateUpdated(call: Call) {
         Logger.log.i(message: "TxClient:: callStateUpdated()")
+        // The redone push login was too late: the server had already bound
+        // the call to the old socket and ends it with a BYE before any
+        // INVITE (DESTINATION_OUT_OF_ORDER, Corsa 2026-11-06 15:09/15:10,
+        // Wi-Fi turned off as the push arrived). That is a stranded ring, not
+        // an ended call: the new socket is up, so the app has it re-rung.
+        if case .DONE = call.callState, let callId = call.callInfo?.callId,
+           callId == redonePushCallId, isPushPlaceholder(call) {
+            redonePushCallId = nil
+            Logger.log.w(message: "[CALL-RECOVERY] the call was bound to the old socket after all; releasing it for a re-ring")
+            calls.removeValue(forKey: callId)
+            releaseActiveCall(callId)
+            if let pendingAnswer = answerCallAction {
+                pendingAnswer.fulfill()
+                answerCallAction = nil
+                releaseActiveCall(pendingAnswer.callUUID)
+            }
+            resetPushVariables()
+            delegate?.onRingingCallStranded(callId: callId)
+            return
+        }
         call.onInboundRtpSample = { [weak self, weak call] _, packetsReceived in
             guard let self = self, let call = call else { return }
             self.signalingHealthMonitor.inboundRtpSampleReceived(packetsReceived, for: call)
@@ -2322,6 +2346,7 @@ extension TxClient : SocketDelegate {
             return false
         }
         Logger.log.w(message: "[CALL-RECOVERY] \(trigger) before the push login was answered: logging in again on a new socket")
+        redonePushCallId = callUUID
         calls.removeValue(forKey: callUUID)
         viabilityWorkItem?.cancel()
         viabilityWorkItem = nil
