@@ -2193,7 +2193,7 @@ extension TxClient : SocketDelegate {
         // the call silent until the reconnect timeout ended it, while the far
         // end stayed connected. disconnect() removes every call before closing
         // the socket, so an intended disconnect never takes this path.
-        if hasLiveCalls, ringingInboundCall != nil, strandRingingPushCall(trigger: "socket closed") {
+        if strandablePushCall != nil, rescuePushCall(trigger: "socket closed") {
             return
         }
         if hasLiveCalls {
@@ -2218,7 +2218,7 @@ extension TxClient : SocketDelegate {
         Logger.log.e(message:"TxClient:: Socket Error" +  error.localizedDescription)
         // Same as an unexpected close: a socket error during a live call must
         // lead back to the session, not end recovery.
-        if hasLiveCalls, ringingInboundCall != nil, strandRingingPushCall(trigger: "socket error") {
+        if strandablePushCall != nil, rescuePushCall(trigger: "socket error") {
             return
         }
         if hasLiveCalls {
@@ -2235,7 +2235,7 @@ extension TxClient : SocketDelegate {
             guard let self = self else { return }
             self.viabilityWorkItem?.cancel()
             self.viabilityWorkItem = nil
-            guard !viable, self.hasLiveCalls, !self.pathRecoveryInFlight else { return }
+            guard !viable, self.hasLiveCalls || self.pendingPushPlaceholder != nil, !self.pathRecoveryInFlight else { return }
             if let changedAt = self.lastPathChangeAt, Date().timeIntervalSince(changedAt) < 3 {
                 // The interface the socket was on has just gone: nothing to
                 // wait out.
@@ -2246,7 +2246,7 @@ extension TxClient : SocketDelegate {
             // a path gone that the path monitor has not reported, or will
             // not: a Wi-Fi that is still "up" but carries nothing.
             let item = DispatchWorkItem { [weak self] in
-                guard let self = self, self.hasLiveCalls, !self.pathRecoveryInFlight else { return }
+                guard let self = self, self.hasLiveCalls || self.pendingPushPlaceholder != nil, !self.pathRecoveryInFlight else { return }
                 self.beginPathChangeRecovery(trigger: "socket not viable for 2s", keepSignalingIfViable: false)
             }
             self.viabilityWorkItem = item
@@ -2272,7 +2272,10 @@ extension TxClient : SocketDelegate {
     /// on an interface that is gone still looks open to the server, and an
     /// invite sent down it is lost without a push.
     private func networkPathDidChange() {
-        if hasLiveCalls {
+        if pendingPushPlaceholder != nil {
+            lastPathChangeAt = Date()
+            beginPathChangeRecovery(trigger: "network path changed")
+        } else if hasLiveCalls {
             lastPathChangeAt = Date()
             beginPathChangeRecovery(trigger: "network path changed")
         } else if socket != nil, !isCallFromPush, gatewayState == .REGED {
@@ -2291,6 +2294,77 @@ extension TxClient : SocketDelegate {
             idlePathCycleWorkItem = item
             DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: item)
         }
+    }
+
+    /// The placeholder of a push call whose INVITE has not arrived.
+    private var pendingPushPlaceholder: Call? {
+        guard isCallFromPush, pushCallState != .inviteReceived else { return nil }
+        return calls.values.first { isPushPlaceholder($0) }
+    }
+
+    /// A push call that a lost socket can strand: ringing with its offer, or
+    /// still waiting for it.
+    private var strandablePushCall: Call? {
+        ringingInboundCall ?? pendingPushPlaceholder
+    }
+
+    /// The push login was not answered before its socket went: the server
+    /// has not bound the call to that socket, so the push login is simply
+    /// run again on a new one and the INVITE comes there. Wi-Fi turned off
+    /// a second after the push, before the login came back, left the push
+    /// flow waiting on a dead socket and the answer went nowhere (Corsa,
+    /// 2026-11-06 14:24, 14:26, 14:28).
+    private func redoPushLogin(trigger: String) -> Bool {
+        guard isCallFromPush, pushCallState != .inviteReceived, gatewayState != .REGED,
+              let placeholder = pendingPushPlaceholder,
+              let callUUID = placeholder.callInfo?.callId,
+              let serverConfiguration = storedServerConfiguration else {
+            return false
+        }
+        Logger.log.w(message: "[CALL-RECOVERY] \(trigger) before the push login was answered: logging in again on a new socket")
+        calls.removeValue(forKey: callUUID)
+        viabilityWorkItem?.cancel()
+        viabilityWorkItem = nil
+        idlePathCycleWorkItem?.cancel()
+        idlePathCycleWorkItem = nil
+        closeSupersededSocket()
+        socket?.delegate = nil
+        socket?.disconnect(reconnect: false)
+        socket = nil
+        pushCallState = .idle
+        do {
+            try connectSocketOnly(serverConfiguration: serverConfiguration)
+        } catch {
+            Logger.log.e(message: "[CALL-RECOVERY] Push login redo could not connect: \(error.localizedDescription)")
+            return true
+        }
+        if let socket = socket {
+            calls[callUUID] = Call(callId: callUUID,
+                                   remoteSdp: "",
+                                   sessionId: callUUID.uuidString.lowercased(),
+                                   socket: socket,
+                                   delegate: self,
+                                   iceServers: serverConfiguration.webRTCIceServers,
+                                   debug: txConfig?.debug ?? false,
+                                   forceRelayCandidate: txConfig?.forceRelayCandidate ?? false,
+                                   sendWebRTCStatsViaSocket: txConfig?.sendWebRTCStatsViaSocket ?? false,
+                                   useTrickleIce: txConfig?.useTrickleIce ?? false,
+                                   enableMissedCallNotifications: txConfig?.enableMissedCallNotifications ?? false,
+                                   enableCallReports: txConfig?.enableCallReports ?? true,
+                                   callReportInterval: txConfig?.callReportInterval ?? 5.0,
+                                   callReportLogLevel: txConfig?.callReportLogLevel ?? "debug",
+                                   callReportMaxLogEntries: txConfig?.callReportMaxLogEntries ?? 1000,
+                                   pushWhenActive: storedTxConfig?.pushWhenActive ?? false,
+                                   pushDeviceToken: storedTxConfig?.pushNotificationConfig?.pushDeviceToken)
+            currentCallId = callUUID
+        }
+        return true
+    }
+
+    /// A push call's socket is gone: redo the login if it had not been
+    /// answered, else let the call go for a re-ring.
+    private func rescuePushCall(trigger: String) -> Bool {
+        redoPushLogin(trigger: trigger) || strandRingingPushCall(trigger: trigger)
     }
 
     /// An inbound call that has its offer and is still ringing.
@@ -2318,11 +2392,18 @@ extension TxClient : SocketDelegate {
     /// again, which arrives as a new push on the new network. A socket that is
     /// still viable is kept, and the call with it.
     private func strandRingingPushCall(trigger: String) -> Bool {
-        guard answerCallAction == nil, !pendingCallDecline,
-              let ringing = ringingInboundCall,
+        guard !pendingCallDecline,
+              let ringing = strandablePushCall,
               let callUUID = ringing.callInfo?.callId,
               isCallFromPush || callUUID == pushOfferedCallId else {
             return false
+        }
+        // Answered before its INVITE: CallKit's action is fulfilled here, and
+        // the app answers the re-rung call when it lands.
+        if let pendingAnswer = answerCallAction {
+            pendingAnswer.fulfill()
+            answerCallAction = nil
+            releaseActiveCall(pendingAnswer.callUUID)
         }
         Logger.log.w(message: "[CALL-RECOVERY] \(trigger) while ringing: a ringing call cannot move sockets; releasing it for a re-ring")
         ringing.endForAttachCall()
@@ -2381,12 +2462,12 @@ extension TxClient : SocketDelegate {
             Logger.log.i(message: "TxClient:: Reconnect Disabled")
             return
         }
-        if ringingInboundCall != nil {
+        if strandablePushCall != nil {
             if keepSignalingIfViable, socketViable, socket?.isConnected == true, gatewayState == .REGED {
                 Logger.log.i(message: "[CALL-RECOVERY] \(trigger) while ringing: socket still viable, keeping it")
                 return
             }
-            if strandRingingPushCall(trigger: trigger) {
+            if rescuePushCall(trigger: trigger) {
                 return
             }
         }
